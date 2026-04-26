@@ -85,6 +85,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [Partials.Channel, Partials.Message],
 });
@@ -97,8 +98,8 @@ const CONFIG = {
   ticketLogChannelId: process.env.TICKET_LOG_CHANNEL_ID,
   staffRoleId: process.env.STAFF_ROLE_ID,
   panelChannelId: process.env.PANEL_CHANNEL_ID,
-  panelTitle: "Support Tickets",
-  panelDescription: "Kliknij przycisk poniżej, aby otworzyć ticket.",
+  panelTitle: "Stwóż ticket!✉️",
+  panelDescription: "Kliknij przycisk poniżej, aby otworzyć ticket, pamietaj żeby opisać dokladnie powód, twożenie nie potrzebnie ticketów grozi zawieszeniem",
 };
 
 // ====== ANTY-DUPLIKAT TWORZENIA ======
@@ -159,6 +160,125 @@ function getLevelData(guildId, userId) {
   return levels[key];
 }
 const xpCooldown = new Map();
+const VC_XP_INTERVAL_MS = 60 * 1000;
+const TEXT_XP_COOLDOWN_MS = 60 * 1000;
+const TEXT_MIN_LENGTH_FOR_XP = 3;
+const VC_MIN_HUMANS_IN_CHANNEL = 2;
+const LEVEL_ROLE_SHOP = [
+  { costLevel: 10, roleId: "1497920118267711550" },
+  { costLevel: 20, roleId: "1497920168628719726" },
+  { costLevel: 45, roleId: "1497920704618827987" },
+].sort((a, b) => a.costLevel - b.costLevel);
+
+function addXp(guildId, userId, xpAmount) {
+  const userData = getLevelData(guildId, userId);
+  userData.xp += xpAmount;
+  userData.totalXp += xpAmount;
+
+  let leveledUp = false;
+  while (userData.xp >= getRequiredXp(userData.level)) {
+    userData.xp -= getRequiredXp(userData.level);
+    userData.level += 1;
+    leveledUp = true;
+  }
+
+  return { userData, leveledUp };
+}
+
+function getGuildLeaderboard(guildId) {
+  const guildPrefix = `${guildId}_`;
+  return Object.entries(levels)
+    .filter(([entryKey]) => entryKey.startsWith(guildPrefix))
+    .sort(([, a], [, b]) => b.totalXp - a.totalXp);
+}
+
+function getUserRankPosition(guildId, userId) {
+  const board = getGuildLeaderboard(guildId);
+  const targetKey = getLevelKey(guildId, userId);
+  const index = board.findIndex(([entryKey]) => entryKey === targetKey);
+  return index === -1 ? null : index + 1;
+}
+
+function canGetTextXp(message) {
+  if (!message.guild || message.author.bot) return false;
+  const trimmed = (message.content || "").trim();
+  if (!trimmed && message.attachments.size === 0) return false;
+  if (trimmed.startsWith(LEVEL_PREFIX)) return false; // komendy nie dają XP
+  return trimmed.length >= TEXT_MIN_LENGTH_FOR_XP || message.attachments.size > 0;
+}
+
+function canGetVoiceXp(member, channel, guild) {
+  if (!member || member.user.bot) return false;
+  if (guild.afkChannelId && channel.id === guild.afkChannelId) return false;
+  const voiceState = member.voice;
+  if (!voiceState) return false;
+  if (
+    voiceState.selfDeaf ||
+    voiceState.serverDeaf ||
+    voiceState.selfMute ||
+    voiceState.serverMute
+  ) {
+    return false;
+  }
+
+  const nonBotMembers = channel.members.filter((m) => !m.user.bot).size;
+  return nonBotMembers >= VC_MIN_HUMANS_IN_CHANNEL;
+}
+
+function resolveRoleIdFromInput(rawValue) {
+  if (!rawValue) return null;
+  const mentionMatch = rawValue.match(/^<@&(\d+)>$/);
+  if (mentionMatch) return mentionMatch[1];
+  const idMatch = rawValue.match(/^\d+$/);
+  if (idMatch) return rawValue;
+  return null;
+}
+
+async function sendRoleShop(message) {
+  if (!LEVEL_ROLE_SHOP.length) {
+    await message.reply("Sklep ról jest pusty.");
+    return;
+  }
+
+  const lines = LEVEL_ROLE_SHOP.map((item, index) => {
+    const role = message.guild.roles.cache.get(item.roleId);
+    const roleDisplay = role ? `${role}` : `Rola (${item.roleId})`;
+    return `${index + 1}. ${roleDisplay} - koszt: **${item.costLevel} lvl**`;
+  });
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle("Sklep ról (za levele)")
+    .setDescription(lines.join("\n"))
+    .setFooter({ text: `Kupno: ${LEVEL_PREFIX}kup @rola` })
+    .setTimestamp();
+
+  await message.reply({ embeds: [embed] });
+}
+
+async function sendTopLevels(message) {
+  const sorted = getGuildLeaderboard(message.guild.id).slice(0, 10);
+
+  if (!sorted.length) {
+    await message.reply("Brak danych leveli na tym serwerze.");
+    return;
+  }
+
+  const lines = sorted.map(([entryKey, value], index) => {
+    const userId = entryKey.replace(guildPrefix, "");
+    const member = message.guild.members.cache.get(userId);
+    const username = member?.user?.tag || `Użytkownik (${userId})`;
+    return `${index + 1}. **${username}** - lvl ${value.level} (${value.totalXp} XP)`;
+  });
+
+  const topEmbed = new EmbedBuilder()
+    .setColor(0xf1c40f)
+    .setTitle("Top 10 leveli")
+    .setDescription(lines.join("\n"))
+    .setTimestamp();
+
+  await message.reply({ embeds: [topEmbed] });
+}
 
 // ====== HELPERY ======
 function sanitizeName(str) {
@@ -260,7 +380,7 @@ client.once("ready", async () => {
       const row = new ActionRowBuilder().addComponents(
         new ButtonBuilder()
           .setCustomId("ticket_create")
-          .setLabel("Utwórz ticket")
+          .setLabel("Utwórz ticket✅")
           .setStyle(ButtonStyle.Success)
       );
 
@@ -283,35 +403,56 @@ client.once("ready", async () => {
       }
     }
   }
+
+  // XP za siedzenie na VC
+  setInterval(() => {
+    for (const guild of client.guilds.cache.values()) {
+      let changed = false;
+      for (const channel of guild.channels.cache.values()) {
+        if (
+          channel.type !== ChannelType.GuildVoice &&
+          channel.type !== ChannelType.GuildStageVoice
+        ) {
+          continue;
+        }
+        if (!channel.members || !channel.members.size) continue;
+
+        for (const [memberId, member] of channel.members) {
+          if (!canGetVoiceXp(member, channel, guild)) continue;
+          const xpGain = Math.floor(Math.random() * 5) + 8; // 8-12 XP/min na VC
+          addXp(guild.id, memberId, xpGain);
+          changed = true;
+        }
+      }
+      if (changed) saveLevels();
+    }
+  }, VC_XP_INTERVAL_MS);
 });
 
 client.on("messageCreate", async (message) => {
   if (!message.guild || message.author.bot) return;
 
-  const key = getLevelKey(message.guild.id, message.author.id);
-  const now = Date.now();
-  const cooldownUntil = xpCooldown.get(key) || 0;
-  if (now >= cooldownUntil) {
-    const xpGain = Math.floor(Math.random() * 11) + 15; // 15-25 XP
-    const userData = getLevelData(message.guild.id, message.author.id);
-    userData.xp += xpGain;
-    userData.totalXp += xpGain;
-
-    let leveledUp = false;
-    while (userData.xp >= getRequiredXp(userData.level)) {
-      userData.xp -= getRequiredXp(userData.level);
-      userData.level += 1;
-      leveledUp = true;
-    }
-
-    if (leveledUp) {
-      await message.channel.send(
-        `🎉 ${message.author}, wbiłeś **${userData.level} poziom**!`
+  if (canGetTextXp(message)) {
+    const key = getLevelKey(message.guild.id, message.author.id);
+    const now = Date.now();
+    const cooldownUntil = xpCooldown.get(key) || 0;
+    if (now >= cooldownUntil) {
+      const xpGain = Math.floor(Math.random() * 11) + 15; // 15-25 XP
+      const { userData, leveledUp } = addXp(
+        message.guild.id,
+        message.author.id,
+        xpGain
       );
-    }
 
-    xpCooldown.set(key, now + 60 * 1000);
-    saveLevels();
+      if (leveledUp) {
+        await message.channel.send(
+          `🎉 ${message.author}, wbiłeś **${userData.level} poziom**!`
+        );
+      }
+
+      xpCooldown.set(key, now + TEXT_XP_COOLDOWN_MS);
+      saveLevels();
+    }
   }
 
   if (!message.content.startsWith(LEVEL_PREFIX)) return;
@@ -320,9 +461,15 @@ client.on("messageCreate", async (message) => {
   const command = (args.shift() || "").toLowerCase();
 
   if (command === "lvl" || command === "rank") {
+    if ((args[0] || "").toLowerCase() === "top") {
+      await sendTopLevels(message);
+      return;
+    }
+
     const targetUser = message.mentions.users.first() || message.author;
     const targetData = getLevelData(message.guild.id, targetUser.id);
     const neededXp = getRequiredXp(targetData.level);
+    const rankPosition = getUserRankPosition(message.guild.id, targetUser.id);
 
     const rankEmbed = new EmbedBuilder()
       .setColor(0x5865f2)
@@ -331,7 +478,12 @@ client.on("messageCreate", async (message) => {
       .addFields(
         { name: "Poziom", value: `${targetData.level}`, inline: true },
         { name: "XP", value: `${targetData.xp}/${neededXp}`, inline: true },
-        { name: "Łączne XP", value: `${targetData.totalXp}`, inline: true }
+        { name: "Łączne XP", value: `${targetData.totalXp}`, inline: true },
+        {
+          name: "Pozycja w rankingu",
+          value: rankPosition ? `#${rankPosition}` : "Poza rankingiem",
+          inline: true,
+        }
       )
       .setTimestamp();
 
@@ -340,31 +492,72 @@ client.on("messageCreate", async (message) => {
   }
 
   if (command === "top") {
-    const guildPrefix = `${message.guild.id}_`;
-    const sorted = Object.entries(levels)
-      .filter(([entryKey]) => entryKey.startsWith(guildPrefix))
-      .sort(([, a], [, b]) => b.totalXp - a.totalXp)
-      .slice(0, 10);
+    await sendTopLevels(message);
+    return;
+  }
 
-    if (!sorted.length) {
-      await message.reply("Brak danych leveli na tym serwerze.");
+  if (command === "sklep") {
+    await sendRoleShop(message);
+    return;
+  }
+
+  if (command === "kup") {
+    const roleInput = args[0];
+    const roleId = resolveRoleIdFromInput(roleInput);
+    if (!roleId) {
+      await message.reply(`Użycie: \`${LEVEL_PREFIX}kup @rola\``);
       return;
     }
 
-    const lines = sorted.map(([entryKey, value], index) => {
-      const userId = entryKey.replace(guildPrefix, "");
-      const member = message.guild.members.cache.get(userId);
-      const username = member?.user?.tag || `Użytkownik (${userId})`;
-      return `${index + 1}. **${username}** - lvl ${value.level} (${value.totalXp} XP)`;
-    });
+    const shopItem = LEVEL_ROLE_SHOP.find((item) => item.roleId === roleId);
+    if (!shopItem) {
+      await message.reply("Tej roli nie ma w sklepie.");
+      return;
+    }
 
-    const topEmbed = new EmbedBuilder()
-      .setColor(0xf1c40f)
-      .setTitle("Top 10 leveli")
-      .setDescription(lines.join("\n"))
-      .setTimestamp();
+    const role = message.guild.roles.cache.get(shopItem.roleId);
+    if (!role) {
+      await message.reply("Nie znaleziono tej roli na serwerze.");
+      return;
+    }
 
-    await message.reply({ embeds: [topEmbed] });
+    const member = message.member;
+    if (!member) {
+      await message.reply("Nie udało się pobrać Twojego profilu członka serwera.");
+      return;
+    }
+
+    if (member.roles.cache.has(role.id)) {
+      await message.reply("Masz już tę rolę.");
+      return;
+    }
+
+    const userData = getLevelData(message.guild.id, message.author.id);
+    if (userData.level < shopItem.costLevel) {
+      await message.reply(
+        `Masz za niski level. Potrzebujesz **${shopItem.costLevel} lvl**, a masz **${userData.level} lvl**.`
+      );
+      return;
+    }
+
+    userData.level -= shopItem.costLevel;
+    const maxXpForCurrentLevel = getRequiredXp(userData.level) - 1;
+    userData.xp = Math.max(0, Math.min(userData.xp, maxXpForCurrentLevel));
+    saveLevels();
+
+    try {
+      await member.roles.add(role.id, `Zakup roli za ${shopItem.costLevel} lvl`);
+      await message.reply(
+        `✅ Kupiłeś rolę ${role} za **${shopItem.costLevel} lvl**. Twój nowy poziom: **${userData.level}**.`
+      );
+    } catch (err) {
+      userData.level += shopItem.costLevel;
+      saveLevels();
+      console.error("Błąd przy nadawaniu roli ze sklepu:", err);
+      await message.reply(
+        "Nie udało się nadać roli. Sprawdź, czy bot ma uprawnienie `Manage Roles` i wyższą pozycję roli."
+      );
+    }
   }
 });
 
